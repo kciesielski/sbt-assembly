@@ -28,6 +28,7 @@ object Plugin extends sbt.Plugin {
     lazy val packageDependency = TaskKey[File]("assembly-package-dependency", "Produces the dependency artifact.")
   
     lazy val assembleArtifact  = SettingKey[Boolean]("assembly-assemble-artifact", "Enables (true) or disables (false) assembling an artifact.")
+    lazy val signPackagedDeps  = SettingKey[Boolean]("assembly-sign-packaged-deps", "Enables (true) or disables (false) adding MD5 to jar file with packaged dependencies.")
     lazy val assemblyOption    = SettingKey[AssemblyOption]("assembly-option")
     lazy val jarName           = TaskKey[String]("assembly-jar-name")
     lazy val defaultJarName    = TaskKey[String]("assembly-default-jar-name")
@@ -155,6 +156,23 @@ object Plugin extends sbt.Plugin {
   private def assemblyTask(out: File, po: Seq[PackageOption], mappings: File => Seq[MappingSet],
       strats: String => MergeStrategy, tempDir: File, cacheOutput: Boolean, cacheDir: File, cacheUnzip: Boolean, log: Logger): File =
     Assembly(out, po, mappings, strats, tempDir, cacheOutput, cacheDir, cacheUnzip, log)
+
+  private def doSign(file: File, classPath: Types.Id[Keys.Classpath], log: Logger): File = {
+    val sortedDeps = classPath.map(_.data.getName).filter(_.endsWith(".jar")).sorted
+
+    val md5 = java.security.MessageDigest.getInstance("MD5").digest(sortedDeps.mkString(":").getBytes)
+      .map("%02X".format(_)).mkString
+
+    val depsJarPath = file.getAbsolutePath
+    val newName = depsJarPath.replaceAll("\\.[^.]*$", "") + "-" +  md5 + ".jar"
+    val newFile = new File(newName)
+    val renamed = file.renameTo(newFile)
+    if (!renamed)
+      log.error("Could not rename file " + depsJarPath + " to " + newName)
+    else
+      log.info("Renamed target jar to " + newFile.getName)
+    file
+  }
 
   object Assembly {
     def apply(out: File, po: Seq[PackageOption], mappings: File => Seq[MappingSet],
@@ -387,8 +405,12 @@ object Plugin extends sbt.Plugin {
 
     packageDependency <<= (outputPath in packageDependency, packageOptions in assembly,
         assembledMappings in packageDependency, mergeStrategy in assembly,
-        assemblyDirectory in assembly, assemblyCacheOutput in assembly, cacheDirectory, assemblyCacheUnzip in assembly, streams) map {
-      (out, po, am, ms, tempDir, co, cacheDir, acu, s) => assemblyTask(out, po, am, ms, tempDir, co, cacheDir, acu, s.log) },
+        assemblyDirectory in assembly, assemblyCacheOutput in assembly, cacheDirectory,
+        assemblyCacheUnzip in assembly, streams, signPackagedDeps in packageDependency, fullClasspath in Runtime) map {
+      (out, po, am, ms, tempDir, co, cacheDir, acu, s, sign, classPath) =>
+        val file = assemblyTask(out, po, am, ms, tempDir, co, cacheDir, acu, s.log)
+        if (sign) doSign(file, classPath, s.log) else file
+       },
     
     assembledMappings in packageDependency <<= (assemblyOption in packageDependency, fullClasspath in assembly, dependencyClasspath in assembly,
         excludedJars in assembly, assemblyCacheUnzip in assembly, streams) map {
@@ -440,7 +462,8 @@ object Plugin extends sbt.Plugin {
     excludedJars in assembly := Nil,
     assembleArtifact in packageBin := true,
     assembleArtifact in packageScala := true,
-    assembleArtifact in packageDependency := true    
+    assembleArtifact in packageDependency := true,
+    signPackagedDeps in packageDependency := false
   )
   
   lazy val assemblySettings: Seq[sbt.Def.Setting[_]] = baseAssemblySettings
