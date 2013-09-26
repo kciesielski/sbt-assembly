@@ -28,7 +28,7 @@ object Plugin extends sbt.Plugin {
     lazy val packageDependency = TaskKey[File]("assembly-package-dependency", "Produces the dependency artifact.")
   
     lazy val assembleArtifact  = SettingKey[Boolean]("assembly-assemble-artifact", "Enables (true) or disables (false) assembling an artifact.")
-    lazy val signPackagedDeps  = SettingKey[Boolean]("assembly-sign-packaged-deps", "Enables (true) or disables (false) adding MD5 to jar file with packaged dependencies.")
+    lazy val appendContentHash = SettingKey[Boolean]("assembly-append-content-hash", "Enables (true) or disables (false) adding SHA-1 to final artifact's name.")
     lazy val assemblyOption    = SettingKey[AssemblyOption]("assembly-option")
     lazy val jarName           = TaskKey[String]("assembly-jar-name")
     lazy val defaultJarName    = TaskKey[String]("assembly-default-jar-name")
@@ -154,29 +154,14 @@ object Plugin extends sbt.Plugin {
     }
 
   private def assemblyTask(out: File, po: Seq[PackageOption], mappings: File => Seq[MappingSet],
-      strats: String => MergeStrategy, tempDir: File, cacheOutput: Boolean, cacheDir: File, cacheUnzip: Boolean, log: Logger): File =
-    Assembly(out, po, mappings, strats, tempDir, cacheOutput, cacheDir, cacheUnzip, log)
-
-  private def doSign(file: File, classPath: Types.Id[Keys.Classpath], log: Logger): File = {
-    val sortedDeps = classPath.map(_.data.getName).filter(_.endsWith(".jar")).sorted
-
-    val md5 = java.security.MessageDigest.getInstance("MD5").digest(sortedDeps.mkString(":").getBytes)
-      .map("%02X".format(_)).mkString
-
-    val depsJarPath = file.getAbsolutePath
-    val newName = depsJarPath.replaceAll("\\.[^.]*$", "") + "-" +  md5 + ".jar"
-    val newFile = new File(newName)
-    val renamed = file.renameTo(newFile)
-    if (!renamed)
-      log.error("Could not rename file " + depsJarPath + " to " + newName)
-    else
-      log.info("Renamed target jar to " + newFile.getName)
-    file
-  }
+      strats: String => MergeStrategy, tempDir: File, cacheOutput: Boolean, cacheDir: File,
+      cacheUnzip: Boolean, log: Logger, appendContentHash: Boolean): File =
+    Assembly(out, po, mappings, strats, tempDir, cacheOutput, cacheDir, cacheUnzip, log, appendContentHash)
 
   object Assembly {
     def apply(out: File, po: Seq[PackageOption], mappings: File => Seq[MappingSet],
-        strats: String => MergeStrategy, tempDir: File, cacheOutput: Boolean, cacheDir: File, cacheUnzip: Boolean, log: Logger): File = {
+        strats: String => MergeStrategy, tempDir: File, cacheOutput: Boolean,
+        cacheDir: File, cacheUnzip: Boolean, log: Logger, appendContentHash: Boolean): File = {
       import Tracked.{inputChanged, outputChanged}
       import Types.:+:
       import Cache._
@@ -200,15 +185,27 @@ object Plugin extends sbt.Plugin {
           else log.info("Assembly up to date: " + jar.file)        
         }
       }
-
       lazy val inputs = sha1.digest((mappingSets flatMap { _.dependencyFiles } map {hash.apply}).toString.getBytes("UTF-8")).toSeq
       if (cacheOutput) {
         log.info("Checking every *.class/*.jar file's SHA-1.")
         cachedMakeJar(inputs)(() => exists(out))  
       }
       else makeJar
-      out
+      if (appendContentHash) doAppendContentHash(inputs, out, log) else out
     }
+
+    private def doAppendContentHash(inputs: Seq[Byte], out: File, log: Logger) = {
+      val fullSha1 = inputs.map( b => "%02x".format(b) ).mkString
+      val newName = out.getName.replaceAll("\\.[^.]*$", "") + "-" +  fullSha1 + ".jar"
+      val newFile = new File(newName)
+      val renamed = out.renameTo(newFile)
+      if (!renamed)
+        log.error("Could not rename file " + out.getName + " to " + newName)
+      else
+        log.info("Renamed target jar to " + newFile.getName)
+      newFile
+    }
+
     def applyStrategies(srcSets: Seq[MappingSet], strats: String => MergeStrategy,
         tempDir: File, log: Logger): Seq[(File, String)] = {
       val srcs = srcSets.flatMap( _.mappings )
@@ -294,7 +291,6 @@ object Plugin extends sbt.Plugin {
     
     val jarDirs = for(jar <- libsFiltered.par) yield {
       val jarName = jar.asFile.getName
-      
       val hash = sha1name(jar) + "_" + sha1content(jar)
       val jarNamePath = tempDir / (hash + ".jarName")
       val dest = tempDir / hash
@@ -379,9 +375,10 @@ object Plugin extends sbt.Plugin {
   lazy val baseAssemblySettings: Seq[sbt.Def.Setting[_]] = Seq(
     assembly <<= (test in assembly, outputPath in assembly, packageOptions in assembly,
         assembledMappings in assembly, mergeStrategy in assembly,
-        assemblyDirectory in assembly, assemblyCacheOutput in assembly, cacheDirectory, assemblyCacheUnzip in assembly, streams) map {
-      (test, out, po, am, ms, tempDir, co, cacheDir, acu, s) =>
-        assemblyTask(out, po, am, ms, tempDir, co, cacheDir, acu, s.log) },
+        assemblyDirectory in assembly, assemblyCacheOutput in assembly, cacheDirectory,
+        assemblyCacheUnzip in assembly, streams, appendContentHash in assembly) map {
+      (test, out, po, am, ms, tempDir, co, cacheDir, acu, s, appendHash) =>
+        assemblyTask(out, po, am, ms, tempDir, co, cacheDir, acu, s.log, appendHash) },
     
     assemblyCacheOutput in assembly := true,
     
@@ -395,8 +392,9 @@ object Plugin extends sbt.Plugin {
 
     packageScala <<= (outputPath in packageScala, packageOptions,
         assembledMappings in packageScala, mergeStrategy in assembly,
-        assemblyDirectory in assembly, assemblyCacheOutput in assembly, cacheDirectory, assemblyCacheUnzip in assembly, streams) map {
-      (out, po, am, ms, tempDir, co, cacheDir, acu, s) => assemblyTask(out, po, am, ms, tempDir, co, cacheDir, acu, s.log) },
+        assemblyDirectory in assembly, assemblyCacheOutput in assembly,
+        cacheDirectory, assemblyCacheUnzip in assembly, streams, appendContentHash in packageScala) map {
+      (out, po, am, ms, tempDir, co, cacheDir, acu, s, appendHash) => assemblyTask(out, po, am, ms, tempDir, co, cacheDir, acu, s.log, appendHash) },
 
     assembledMappings in packageScala <<= (assemblyOption in packageScala, fullClasspath in assembly, dependencyClasspath in assembly,
         excludedJars in assembly, assemblyCacheUnzip in assembly, streams) map {
@@ -406,10 +404,9 @@ object Plugin extends sbt.Plugin {
     packageDependency <<= (outputPath in packageDependency, packageOptions in assembly,
         assembledMappings in packageDependency, mergeStrategy in assembly,
         assemblyDirectory in assembly, assemblyCacheOutput in assembly, cacheDirectory,
-        assemblyCacheUnzip in assembly, streams, signPackagedDeps in packageDependency, fullClasspath in Runtime) map {
-      (out, po, am, ms, tempDir, co, cacheDir, acu, s, sign, classPath) =>
-        val file = assemblyTask(out, po, am, ms, tempDir, co, cacheDir, acu, s.log)
-        if (sign) doSign(file, classPath, s.log) else file
+        assemblyCacheUnzip in assembly, streams, appendContentHash in packageDependency) map {
+      (out, po, am, ms, tempDir, co, cacheDir, acu, s, appendHash) =>
+        assemblyTask(out, po, am, ms, tempDir, co, cacheDir, acu, s.log, appendHash)
        },
     
     assembledMappings in packageDependency <<= (assemblyOption in packageDependency, fullClasspath in assembly, dependencyClasspath in assembly,
@@ -463,7 +460,9 @@ object Plugin extends sbt.Plugin {
     assembleArtifact in packageBin := true,
     assembleArtifact in packageScala := true,
     assembleArtifact in packageDependency := true,
-    signPackagedDeps in packageDependency := false
+    appendContentHash in packageDependency := false,
+    appendContentHash in assembly := false,
+    appendContentHash in packageScala := false
   )
   
   lazy val assemblySettings: Seq[sbt.Def.Setting[_]] = baseAssemblySettings
